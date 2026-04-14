@@ -3,7 +3,7 @@ export { Merchant } from "./merchant";
 const SYSTEM_PROMPT = `You are a coffee shop ordering assistant. Given a menu and a customer's request, return a JSON object.
 
 For orders, return:
-{"items":[{"product":"product name","quantity":1,"modifiers":{"ModifierGroupName":"ChoiceName"}}]}
+{"items":[{"product":"product name","quantity":1,"modifiers":{"ModifierGroupName":"ChoiceName"},"note":"any special instructions"}]}
 
 For menu inquiries ("show menu", "what do you have", "what's available"), return:
 {"show_menu":true}
@@ -13,6 +13,7 @@ Rules:
 - Only include modifiers the customer explicitly mentioned. Omit unmentioned ones — defaults are applied automatically.
 - If quantity is not specified, assume 1.
 - Modifier group names and choice names must match the menu exactly (case-insensitive matching is fine).
+- If the customer mentions anything that is NOT a known modifier (e.g. "extra hot", "no sugar", "double shot", "iced", "decaf", "extra foam"), put it in the "note" field. Omit "note" if there are no special instructions.
 - Return ONLY valid JSON. No markdown, no code fences, no explanation.`;
 
 function formatMenuForAI(menu: Record<string, unknown>[]): string {
@@ -81,7 +82,9 @@ export default {
         }
       }
       const qty = item.quantity || 1;
-      items.push({ product_id: product.retailer_id, product_name: product.title, base_price: product.price, quantity: qty, modifiers: appliedMods, item_total: (product.price + modTotal) * qty, currency: product.currency });
+      const entry = { product_id: product.retailer_id, product_name: product.title, base_price: product.price, quantity: qty, modifiers: appliedMods, item_total: (product.price + modTotal) * qty, currency: product.currency };
+      if (item.note) entry.note = item.note;
+      items.push(entry);
     }
     const total = items.reduce((s, i) => s + (i.item_total || 0), 0);
     return Response.json({ order: { items, total, currency: "AUD" } });

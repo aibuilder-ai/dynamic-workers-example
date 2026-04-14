@@ -12,7 +12,7 @@ import {
 type OrderModifier = { group: string; choice: string; price_delta: number };
 type OrderItem = {
   product_id: string; product_name: string; base_price: number;
-  quantity: number; modifiers: OrderModifier[]; item_total: number; currency: string; error?: string;
+  quantity: number; modifiers: OrderModifier[]; item_total: number; currency: string; note?: string; error?: string;
 };
 type Order = { items: OrderItem[]; total: number; currency: string };
 type MenuItem = {
@@ -83,6 +83,11 @@ function OrderView({ order }: { order: Order }) {
                   </Text>
                 </div>
               ))}
+              {item.note && (
+                <div className="pt-1 border-t border-kumo-line mt-1">
+                  <Text size="xs" variant="secondary" className="italic">Note: {item.note}</Text>
+                </div>
+              )}
             </div>
           </Surface>
         )
