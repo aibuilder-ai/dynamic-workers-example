@@ -212,6 +212,8 @@ export class Merchant extends DurableObject {
     if (!trimmed.toUpperCase().startsWith("SELECT")) {
       throw new Error("Only SELECT queries are allowed");
     }
+    console.log(trimmed, '?????');
+    
     return [...this.sql.exec(trimmed)];
   }
 

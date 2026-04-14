@@ -1,9 +1,13 @@
 export { Merchant } from "./merchant";
 
+
 const SYSTEM_PROMPT = `You are a coffee shop ordering assistant. Given a menu and a customer's request, return a JSON object.
 
 For orders, return:
 {"items":[{"product":"product name","quantity":1,"modifiers":{"ModifierGroupName":"ChoiceName"},"note":"any special instructions"}]}
+
+For greetings, chitchat, or anything that is not an order/menu/order-history request, return:
+{"message":"a short friendly reply"}
 
 For menu inquiries ("show menu", "what do you have", "what's available"), return:
 {"show_menu":true}
@@ -32,7 +36,9 @@ Rules:
 - Only include modifiers the customer explicitly mentioned. Omit unmentioned ones — defaults are applied automatically.
 - If quantity is not specified, assume 1.
 - Modifier group names and choice names must match the menu exactly (case-insensitive matching is fine).
-- If the customer mentions anything that is NOT a known modifier (e.g. "extra hot", "no sugar", "double shot", "iced", "decaf", "extra foam"), put it in the "note" field. Omit "note" if there are no special instructions.
+- If some items in a batch have different notes or modifiers, split them into separate line items. E.g. "10 oat latte 2 with one sugar" → two items: 8x oat latte (no note) + 2x oat latte (note: "one sugar"). "5 flat whites, 1 extra hot" → 4x flat white + 1x flat white (note: "extra hot").
+- If the customer mentions anything that is NOT a known modifier (e.g. "extra hot", "no sugar", "2 sugars", "double shot", "iced", "decaf", "extra foam"), put it in the "note" field. Omit "note" if there are no special instructions.
+- "2 flat white with 2 sugars and an oat cappuccino" → {"items":[{"product":"flat white","quantity":2,"modifiers":{},"note":"2 sugars"},{"product":"cappuccino","quantity":1,"modifiers":{"Milk":"Oat"}}]}
 - Return ONLY valid JSON. No markdown, no code fences, no explanation.`;
 
 function formatMenuForAI(menu: Record<string, unknown>[]): string {
@@ -162,7 +168,6 @@ export default {
         const messages: { role: "system" | "user" | "assistant"; content: string }[] = [
           { role: "system", content: SYSTEM_PROMPT + "\n\nMenu:\n" + menuText },
         ];
-        // Add last 10 history entries
         const history = (body.history ?? []).slice(-10);
         for (const h of history) {
           if (h.role === "user" || h.role === "assistant") {
@@ -172,20 +177,29 @@ export default {
         messages.push({ role: "user", content: query });
 
         const aiResponse = await env.AI.run(
-          "@cf/meta/llama-4-scout-17b-16e-instruct" as BaseAiTextGenerationModels,
+          "@cf/meta/llama-3.1-8b-instruct-fp8" as BaseAiTextGenerationModels,
           { messages, max_tokens: 512 }
         );
 
         let intent: Record<string, unknown>;
         const resp = aiResponse as Record<string, unknown>;
-        if (resp.items || resp.show_menu || resp.show_orders || resp.query_orders) { intent = resp; }
-        else if (typeof resp.response === "string") { intent = JSON.parse(extractJson(resp.response)); }
-        else if (resp.response && typeof resp.response === "object") {
+        if (resp.items || resp.show_menu || resp.show_orders || resp.query_orders || resp.message) { intent = resp; }
+        else if (typeof resp.response === "string") {
+          try { intent = JSON.parse(extractJson(resp.response)); }
+          catch {
+            // AI returned plain text — treat as a chat message
+            return Response.json({ ok: true, type: "answer", answer: resp.response });
+          }
+        } else if (resp.response && typeof resp.response === "object") {
           const inner = resp.response as Record<string, unknown>;
-          if (inner.items || inner.show_menu || inner.show_orders || inner.query_orders) intent = inner;
+          if (inner.items || inner.show_menu || inner.show_orders || inner.query_orders || inner.message) intent = inner;
           else return Response.json({ ok: false, error: "Unexpected AI response", raw: JSON.stringify(aiResponse) }, { status: 500 });
         } else {
           return Response.json({ ok: false, error: "Unexpected AI response", raw: JSON.stringify(aiResponse) }, { status: 500 });
+        }
+
+        if (typeof intent.message === "string") {
+          return Response.json({ ok: true, type: "answer", answer: intent.message });
         }
 
         if (intent.show_menu) return Response.json({ ok: true, type: "menu", menu });
@@ -197,16 +211,15 @@ export default {
 
         if (typeof intent.query_orders === "string") {
           const rows = await merchant.query(intent.query_orders);
-          // Second AI call to format the raw SQL result into a natural language answer
           const answerResponse = await env.AI.run(
-            "@cf/meta/llama-4-scout-17b-16e-instruct" as BaseAiTextGenerationModels,
+            "@cf/meta/llama-3.1-8b-instruct-fp8" as BaseAiTextGenerationModels,
             { messages: [
                 { role: "system", content: "You are a helpful assistant. Given a user's question and SQL query results, write a short, friendly answer. Prices are in cents — convert to dollars (e.g. 670 → $6.70). Return ONLY the answer text, no JSON." },
                 { role: "user", content: `Question: ${query}\n\nQuery results:\n${JSON.stringify(rows)}` },
               ], max_tokens: 256 }
           );
           const answerResp = answerResponse as Record<string, unknown>;
-          const answer = String(answerResp.response ?? answerResp.text ?? JSON.stringify(rows));
+          const answer = String(answerResp.response ?? JSON.stringify(rows));
           return Response.json({ ok: true, type: "answer", answer, rows });
         }
 

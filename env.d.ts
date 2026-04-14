@@ -9,6 +9,7 @@ declare namespace Cloudflare {
 		LOADER: WorkerLoader;
 		AI: Ai;
 		MERCHANT: DurableObjectNamespace<import("./src/server").Merchant>;
+		GOOGLE_GENERATIVE_AI_API_KEY: string;
 	}
 }
 interface Env extends Cloudflare.Env {}
