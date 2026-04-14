@@ -1,5 +1,6 @@
 {
   "$schema": "../../node_modules/wrangler/config-schema.json",
+  "account_id": "0531194fc7382f5fc301175a2c198d20",
   "name": "dynamic-workers-example",
   "main": "src/server.ts",
   "compatibility_date": "2026-01-28",
@@ -11,6 +12,23 @@
   "worker_loaders": [
     {
       "binding": "LOADER"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MERCHANT",
+        "class_name": "Merchant"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Merchant"]
     }
   ]
 }

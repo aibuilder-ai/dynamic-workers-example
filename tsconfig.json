@@ -1,3 +1,16 @@
 {
-  "extends": "agents/tsconfig"
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "types": ["@cloudflare/workers-types"]
+  },
+  "include": ["src", "env.d.ts"]
 }
