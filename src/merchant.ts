@@ -72,8 +72,12 @@ export class Merchant extends DurableObject {
       `CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id)`
     );
 
-    const row = [...this.sql.exec("SELECT COUNT(*) as c FROM products")][0] as Record<string, number>;
-    if (row.c === 0) {
+    // Re-seed if sugar modifiers are missing (one-time migration)
+    const hasSugar = [...this.sql.exec("SELECT COUNT(*) as c FROM product_modifier_groups WHERE name = 'Sugar'")][0] as Record<string, number>;
+    if (hasSugar.c === 0) {
+      this.sql.exec("DELETE FROM product_modifiers");
+      this.sql.exec("DELETE FROM product_modifier_groups");
+      this.sql.exec("DELETE FROM products");
       this.seed();
     }
   }
@@ -117,31 +121,47 @@ export class Merchant extends DurableObject {
       mod(g, "Soy", 50, false);
     };
 
+    const addSugar = (pid: number) => {
+      const g = grp(pid, "Sugar", "option", 0, 1);
+      mod(g, "None", 0, true);
+      mod(g, "1", 0, false);
+      mod(g, "2", 0, false);
+      mod(g, "3", 0, false);
+      mod(g, "4", 0, false);
+      mod(g, "5", 0, false);
+    };
+
     const espresso = product("espresso", "Espresso", "Rich double shot of espresso", 400, "Coffee");
     let g = grp(espresso, "Size", "variation", 1, 1);
     mod(g, "Single", 0, true);
     mod(g, "Double", 100, false);
+    addSugar(espresso);
 
     const latte = product("latte", "Latte", "Smooth espresso with steamed milk", 500, "Coffee");
     addSizes(latte);
     addMilk(latte);
+    addSugar(latte);
 
     const capp = product("cappuccino", "Cappuccino", "Espresso with rich foamed milk", 500, "Coffee");
     addSizes(capp);
     addMilk(capp);
+    addSugar(capp);
 
     const flatWhite = product("flat-white", "Flat White", "Double shot with velvety microfoam", 500, "Coffee");
     addSizes(flatWhite);
     addMilk(flatWhite);
+    addSugar(flatWhite);
 
     const mocha = product("mocha", "Mocha", "Espresso with chocolate and steamed milk", 550, "Coffee");
     addSizes(mocha);
     addMilk(mocha);
+    addSugar(mocha);
 
     const longBlack = product("long-black", "Long Black", "Double espresso over hot water", 450, "Coffee");
     g = grp(longBlack, "Size", "variation", 1, 1);
     mod(g, "Regular", 0, true);
     mod(g, "Large", 50, false);
+    addSugar(longBlack);
 
     const banana = product("banana-bread", "Banana Bread", "House-baked banana bread slice", 650, "Food");
     g = grp(banana, "Warmed", "option", 1, 1);

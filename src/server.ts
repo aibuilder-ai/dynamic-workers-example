@@ -1,5 +1,7 @@
 export { Merchant } from "./merchant";
 
+import { generateText } from "ai";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
 
 const SYSTEM_PROMPT = `You are a coffee shop ordering assistant. Given a menu and a customer's request, return a JSON object.
 
@@ -37,8 +39,9 @@ Rules:
 - If quantity is not specified, assume 1.
 - Modifier group names and choice names must match the menu exactly (case-insensitive matching is fine).
 - If some items in a batch have different notes or modifiers, split them into separate line items. E.g. "10 oat latte 2 with one sugar" → two items: 8x oat latte (no note) + 2x oat latte (note: "one sugar"). "5 flat whites, 1 extra hot" → 4x flat white + 1x flat white (note: "extra hot").
-- If the customer mentions anything that is NOT a known modifier (e.g. "extra hot", "no sugar", "2 sugars", "double shot", "iced", "decaf", "extra foam"), put it in the "note" field. Omit "note" if there are no special instructions.
-- "2 flat white with 2 sugars and an oat cappuccino" → {"items":[{"product":"flat white","quantity":2,"modifiers":{},"note":"2 sugars"},{"product":"cappuccino","quantity":1,"modifiers":{"Milk":"Oat"}}]}
+- Sugar is a known modifier with values "None", "1", "2", "3", "4", "5". If the customer says "2 sugars", set "Sugar":"2". If they say "no sugar", set "Sugar":"None".
+- If the customer mentions anything that is NOT a known modifier (e.g. "extra hot", "double shot", "iced", "decaf", "extra foam"), put it in the "note" field. Omit "note" if there are no special instructions.
+- "2 flat white with 2 sugars and an oat cappuccino" → {"items":[{"product":"flat white","quantity":2,"modifiers":{"Sugar":"2"}},{"product":"cappuccino","quantity":1,"modifiers":{"Milk":"Oat"}}]}
 - Return ONLY valid JSON. No markdown, no code fences, no explanation.`;
 
 function formatMenuForAI(menu: Record<string, unknown>[]): string {
@@ -117,9 +120,231 @@ export default {
 };`;
 }
 
+const cents = (n: number) => `$${(n / 100).toFixed(2)}`;
+
+// ── Shared agent logic ───────────────────────────────────────
+
+type AgentResult =
+  | { type: "order"; order: any }
+  | { type: "menu"; menu: any[] }
+  | { type: "orders"; orders: any[] }
+  | { type: "answer"; answer: string }
+  | { type: "error"; error: string };
+
+async function processQuery(
+  env: Env,
+  query: string,
+  history?: { role: string; content: string }[]
+): Promise<AgentResult> {
+  const merchant = env.MERCHANT.get(env.MERCHANT.idFromName("default"));
+  const menu = await merchant.getMenu();
+  const menuText = formatMenuForAI(menu as Record<string, unknown>[]);
+
+  const messages: { role: "system" | "user" | "assistant"; content: string }[] = [
+    { role: "system", content: SYSTEM_PROMPT + "\n\nMenu:\n" + menuText },
+  ];
+  for (const h of (history ?? []).slice(-10)) {
+    if (h.role === "user" || h.role === "assistant") {
+      messages.push({ role: h.role, content: h.content });
+    }
+  }
+  messages.push({ role: "user", content: query });
+
+  const google = createGoogleGenerativeAI({ apiKey: env.GOOGLE_GENERATIVE_AI_API_KEY });
+  const model = google("gemini-3.1-flash-lite-preview");
+
+  const aiResult = await generateText({
+    model,
+    system: messages[0].content,
+    messages: messages.slice(1).map(m => ({ role: m.role as "user" | "assistant", content: m.content })),
+    maxOutputTokens: 512,
+  });
+
+  let intent: Record<string, unknown>;
+  try {
+    intent = JSON.parse(extractJson(aiResult.text));
+  } catch {
+    return { type: "answer", answer: aiResult.text };
+  }
+
+  if (typeof intent.message === "string") {
+    return { type: "answer", answer: intent.message };
+  }
+
+  if (intent.show_menu) {
+    return { type: "menu", menu: menu as any[] };
+  }
+
+  if (intent.show_orders) {
+    const orders = await merchant.getOrders();
+    return { type: "orders", orders: orders as any[] };
+  }
+
+  if (typeof intent.query_orders === "string") {
+    const rows = await merchant.query(intent.query_orders);
+    const answerResult = await generateText({
+      model,
+      system: "You are a helpful assistant. Given a user's question and SQL query results, write a short, friendly answer. Prices are in cents — convert to dollars (e.g. 670 → $6.70). Return ONLY the answer text, no JSON.",
+      prompt: `Question: ${query}\n\nQuery results:\n${JSON.stringify(rows)}`,
+      maxOutputTokens: 256,
+    });
+    return { type: "answer", answer: answerResult.text };
+  }
+
+  if (!Array.isArray(intent.items) || intent.items.length === 0) {
+    return { type: "error", error: "Could not understand order" };
+  }
+
+  const workerCode = buildOrderWorker(menu as unknown[], intent);
+  const worker = env.LOADER.load({
+    compatibilityDate: "2026-01-28",
+    mainModule: "worker.js",
+    modules: { "worker.js": workerCode },
+    globalOutbound: null,
+  });
+
+  const result = await worker.getEntrypoint().fetch(new Request("https://worker/"));
+  const data = await result.json<{ order: any }>();
+  return { type: "order", order: data.order };
+}
+
+// ── Format result as plain text (for Messenger) ──────────────
+
+function formatResultAsText(result: AgentResult): string {
+  if (result.type === "answer" || result.type === "error") {
+    return result.type === "answer" ? result.answer : result.error;
+  }
+  if (result.type === "menu") {
+    return result.menu
+      .map((p: any) => `${p.title} — ${cents(p.price)}`)
+      .join("\n");
+  }
+  if (result.type === "orders") {
+    if (result.orders.length === 0) return "No orders yet.";
+    return result.orders
+      .map((o: any) =>
+        `Order ${new Date(o.created_at).toLocaleDateString()}: ${o.items.map((it: any) => `${it.quantity > 1 ? it.quantity + "x " : ""}${it.product_name}`).join(", ")} — ${cents(o.total)}`
+      )
+      .join("\n");
+  }
+  if (result.type === "order") {
+    const o = result.order;
+    const lines = o.items.map((it: any) => {
+      const mods = it.modifiers
+        .filter((m: any) => m.price_delta > 0)
+        .map((m: any) => m.choice)
+        .join(", ");
+      return `${it.product_name}${mods ? ` (${mods})` : ""} x${it.quantity} — ${cents(it.item_total)}${it.note ? ` [${it.note}]` : ""}`;
+    });
+    lines.push(`Total: ${cents(o.total)} ${o.currency}`);
+    return lines.join("\n");
+  }
+  return "Something went wrong.";
+}
+
+// ── Messenger helpers ────────────────────────────────────────
+
+async function verifySignature(request: Request, appSecret: string): Promise<boolean> {
+  const signature = request.headers.get("x-hub-signature-256");
+  if (!signature) return false;
+  const [, hash] = signature.split("=");
+  if (!hash) return false;
+  const body = await request.clone().arrayBuffer();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(appSecret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, body);
+  const expected = [...new Uint8Array(sig)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return hash === expected;
+}
+
+async function sendMessengerReply(pageToken: string, recipientId: string, text: string) {
+  await fetch(`https://graph.facebook.com/v22.0/me/messages?access_token=${pageToken}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      recipient: { id: recipientId },
+      message: { text: text.slice(0, 2000) },
+    }),
+  });
+}
+
+// ── Main handler ─────────────────────────────────────────────
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+
+    // ── Webhook verification (GET) ───────────────────────────
+    if (url.pathname === "/webhook" && request.method === "GET") {
+      const mode = url.searchParams.get("hub.mode");
+      const token = url.searchParams.get("hub.verify_token");
+      const challenge = url.searchParams.get("hub.challenge");
+
+      if (mode === "subscribe" && token === env.FB_VERIFY_TOKEN) {
+        return new Response(challenge, { status: 200 });
+      }
+      return new Response("Forbidden", { status: 403 });
+    }
+
+    // ── Webhook events (POST) ────────────────────────────────
+    if (url.pathname === "/webhook" && request.method === "POST") {
+      // Validate signature
+      if (env.FB_APP_SECRET) {
+        const valid = await verifySignature(request, env.FB_APP_SECRET);
+        if (!valid) return new Response("Invalid signature", { status: 403 });
+      }
+
+      const body = await request.json<{
+        object: string;
+        entry?: { messaging?: { sender: { id: string }; message?: { text?: string } }[] }[];
+      }>();
+
+      if (body.object !== "page") {
+        return new Response("Not found", { status: 404 });
+      }
+
+      // Process messages asynchronously
+      const messagesToProcess: { senderId: string; text: string }[] = [];
+      for (const entry of body.entry ?? []) {
+        for (const event of entry.messaging ?? []) {
+          if (event.message?.text) {
+            messagesToProcess.push({ senderId: event.sender.id, text: event.message.text });
+          }
+        }
+      }
+
+      if (messagesToProcess.length > 0) {
+        ctx.waitUntil(
+          Promise.all(
+            messagesToProcess.map(async ({ senderId, text }) => {
+              try {
+                const result = await processQuery(env, text);
+                const reply = formatResultAsText(result);
+                await sendMessengerReply(env.FB_PAGE_ACCESS_TOKEN, senderId, reply);
+              } catch (err) {
+                console.error("[webhook] error processing message:", err);
+                await sendMessengerReply(
+                  env.FB_PAGE_ACCESS_TOKEN,
+                  senderId,
+                  "Sorry, something went wrong. Please try again."
+                );
+              }
+            })
+          )
+        );
+      }
+
+      return new Response("EVENT_RECEIVED", { status: 200 });
+    }
+
+    // ── API routes ───────────────────────────────────────────
 
     if (url.pathname === "/api/menu") {
       const merchant = env.MERCHANT.get(env.MERCHANT.idFromName("default"));
@@ -160,84 +385,23 @@ export default {
       if (!query) return Response.json({ ok: false, error: "No query provided" }, { status: 400 });
 
       try {
-        const merchant = env.MERCHANT.get(env.MERCHANT.idFromName("default"));
-        const menu = await merchant.getMenu();
-        const menuText = formatMenuForAI(menu as Record<string, unknown>[]);
-
-        // Build messages with conversation history
-        const messages: { role: "system" | "user" | "assistant"; content: string }[] = [
-          { role: "system", content: SYSTEM_PROMPT + "\n\nMenu:\n" + menuText },
-        ];
-        const history = (body.history ?? []).slice(-10);
-        for (const h of history) {
-          if (h.role === "user" || h.role === "assistant") {
-            messages.push({ role: h.role, content: h.content });
-          }
+        const result = await processQuery(env, query, body.history);
+        if (result.type === "error") {
+          return Response.json({ ok: false, error: result.error }, { status: 400 });
         }
-        messages.push({ role: "user", content: query });
-
-        const aiResponse = await env.AI.run(
-          "@cf/meta/llama-3.1-8b-instruct-fp8" as BaseAiTextGenerationModels,
-          { messages, max_tokens: 512 }
-        );
-
-        let intent: Record<string, unknown>;
-        const resp = aiResponse as Record<string, unknown>;
-        if (resp.items || resp.show_menu || resp.show_orders || resp.query_orders || resp.message) { intent = resp; }
-        else if (typeof resp.response === "string") {
-          try { intent = JSON.parse(extractJson(resp.response)); }
-          catch {
-            // AI returned plain text — treat as a chat message
-            return Response.json({ ok: true, type: "answer", answer: resp.response });
-          }
-        } else if (resp.response && typeof resp.response === "object") {
-          const inner = resp.response as Record<string, unknown>;
-          if (inner.items || inner.show_menu || inner.show_orders || inner.query_orders || inner.message) intent = inner;
-          else return Response.json({ ok: false, error: "Unexpected AI response", raw: JSON.stringify(aiResponse) }, { status: 500 });
-        } else {
-          return Response.json({ ok: false, error: "Unexpected AI response", raw: JSON.stringify(aiResponse) }, { status: 500 });
+        if (result.type === "order") {
+          return Response.json({ ok: true, type: "order", order: result.order });
         }
-
-        if (typeof intent.message === "string") {
-          return Response.json({ ok: true, type: "answer", answer: intent.message });
+        if (result.type === "menu") {
+          return Response.json({ ok: true, type: "menu", menu: result.menu });
         }
-
-        if (intent.show_menu) return Response.json({ ok: true, type: "menu", menu });
-
-        if (intent.show_orders) {
-          const orders = await merchant.getOrders();
-          return Response.json({ ok: true, type: "orders", orders });
+        if (result.type === "orders") {
+          return Response.json({ ok: true, type: "orders", orders: result.orders });
         }
-
-        if (typeof intent.query_orders === "string") {
-          const rows = await merchant.query(intent.query_orders);
-          const answerResponse = await env.AI.run(
-            "@cf/meta/llama-3.1-8b-instruct-fp8" as BaseAiTextGenerationModels,
-            { messages: [
-                { role: "system", content: "You are a helpful assistant. Given a user's question and SQL query results, write a short, friendly answer. Prices are in cents — convert to dollars (e.g. 670 → $6.70). Return ONLY the answer text, no JSON." },
-                { role: "user", content: `Question: ${query}\n\nQuery results:\n${JSON.stringify(rows)}` },
-              ], max_tokens: 256 }
-          );
-          const answerResp = answerResponse as Record<string, unknown>;
-          const answer = String(answerResp.response ?? JSON.stringify(rows));
-          return Response.json({ ok: true, type: "answer", answer, rows });
+        if (result.type === "answer") {
+          return Response.json({ ok: true, type: "answer", answer: result.answer });
         }
-
-        if (!Array.isArray(intent.items) || intent.items.length === 0) {
-          return Response.json({ ok: false, error: "Could not understand order", raw: JSON.stringify(intent) }, { status: 400 });
-        }
-
-        const workerCode = buildOrderWorker(menu as unknown[], intent);
-        const worker = env.LOADER.load({
-          compatibilityDate: "2026-01-28",
-          mainModule: "worker.js",
-          modules: { "worker.js": workerCode },
-          globalOutbound: null,
-        });
-
-        const result = await worker.getEntrypoint().fetch(new Request("https://worker/"));
-        const data = await result.json();
-        return Response.json({ ok: true, type: "order", ...data as object });
+        return Response.json({ ok: false, error: "Unknown result type" }, { status: 500 });
       } catch (err) {
         console.error("[agent] error:", err);
         return Response.json({ ok: false, error: err instanceof Error ? err.message : String(err) }, { status: 500 });

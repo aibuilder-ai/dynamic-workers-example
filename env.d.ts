@@ -10,6 +10,9 @@ declare namespace Cloudflare {
 		AI: Ai;
 		MERCHANT: DurableObjectNamespace<import("./src/server").Merchant>;
 		GOOGLE_GENERATIVE_AI_API_KEY: string;
+		FB_VERIFY_TOKEN: string;
+		FB_PAGE_ACCESS_TOKEN: string;
+		FB_APP_SECRET: string;
 	}
 }
 interface Env extends Cloudflare.Env {}
