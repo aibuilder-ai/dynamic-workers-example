@@ -46,6 +46,32 @@ export class Merchant extends DurableObject {
       `CREATE INDEX IF NOT EXISTS idx_mods_group ON product_modifiers(group_id)`
     );
 
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS orders (
+        id TEXT PRIMARY KEY,
+        total INTEGER NOT NULL,
+        currency TEXT NOT NULL DEFAULT 'AUD',
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+      )
+    `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS order_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+        product_retailer_id TEXT NOT NULL,
+        product_name TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        unit_price INTEGER NOT NULL,
+        currency TEXT NOT NULL DEFAULT 'AUD',
+        modifiers TEXT NOT NULL DEFAULT '[]',
+        note TEXT
+      )
+    `);
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id)`
+    );
+
     const row = [...this.sql.exec("SELECT COUNT(*) as c FROM products")][0] as Record<string, number>;
     if (row.c === 0) {
       this.seed();
@@ -141,6 +167,52 @@ export class Merchant extends DurableObject {
     mod(g, "Plain", 0, true);
     mod(g, "Almond", 150, false);
     mod(g, "Chocolate", 100, false);
+  }
+
+  async placeOrder(order: {
+    items: { product_id: string; product_name: string; quantity: number; unit_price: number; currency: string; modifiers: unknown[]; note?: string }[];
+    total: number; currency: string;
+  }) {
+    const id = crypto.randomUUID();
+    this.sql.exec(
+      "INSERT INTO orders (id, total, currency) VALUES (?, ?, ?)",
+      id, order.total, order.currency
+    );
+    for (const item of order.items) {
+      this.sql.exec(
+        "INSERT INTO order_items (order_id, product_retailer_id, product_name, quantity, unit_price, currency, modifiers, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        id, item.product_id, item.product_name, item.quantity, item.unit_price, item.currency, JSON.stringify(item.modifiers), item.note ?? null
+      );
+    }
+    return { id, total: order.total, currency: order.currency, status: "pending" };
+  }
+
+  async getOrders() {
+    const orders = [...this.sql.exec(
+      "SELECT * FROM orders ORDER BY created_at DESC LIMIT 20"
+    )] as Record<string, unknown>[];
+
+    return orders.map((o) => {
+      const items = [...this.sql.exec(
+        "SELECT * FROM order_items WHERE order_id = ?", o.id as string
+      )] as Record<string, unknown>[];
+      return {
+        id: o.id, total: o.total, currency: o.currency, status: o.status, created_at: o.created_at,
+        items: items.map((it) => ({
+          product_id: it.product_retailer_id, product_name: it.product_name,
+          quantity: it.quantity, unit_price: it.unit_price, currency: it.currency,
+          modifiers: JSON.parse(it.modifiers as string), note: it.note,
+        })),
+      };
+    });
+  }
+
+  async query(sql: string) {
+    const trimmed = sql.trim();
+    if (!trimmed.toUpperCase().startsWith("SELECT")) {
+      throw new Error("Only SELECT queries are allowed");
+    }
+    return [...this.sql.exec(trimmed)];
   }
 
   async getMenu() {

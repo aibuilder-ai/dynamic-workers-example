@@ -6,7 +6,8 @@ import {
 } from "@cloudflare/kumo";
 import {
   PaperPlaneRightIcon, TrashIcon, CoffeeIcon, SpinnerGapIcon,
-  MoonIcon, SunIcon, UserIcon, RobotIcon,
+  MoonIcon, SunIcon, UserIcon, RobotIcon, ShoppingCartIcon,
+  CheckCircleIcon, ClockIcon,
 } from "@phosphor-icons/react";
 
 type OrderModifier = { group: string; choice: string; price_delta: number };
@@ -15,6 +16,12 @@ type OrderItem = {
   quantity: number; modifiers: OrderModifier[]; item_total: number; currency: string; note?: string; error?: string;
 };
 type Order = { items: OrderItem[]; total: number; currency: string };
+
+type SavedOrder = {
+  id: string; total: number; currency: string; status: string; created_at: string;
+  items: { product_id: string; product_name: string; quantity: number; unit_price: number; modifiers: OrderModifier[]; note?: string }[];
+};
+
 type MenuItem = {
   id: number; retailer_id: string; title: string; description: string;
   price: number; currency: string; category: string;
@@ -25,6 +32,9 @@ type Message =
   | { role: "user"; text: string }
   | { role: "agent"; type: "order"; order: Order }
   | { role: "agent"; type: "menu"; menu: MenuItem[] }
+  | { role: "agent"; type: "orders"; orders: SavedOrder[] }
+  | { role: "agent"; type: "answer"; answer: string }
+  | { role: "agent"; type: "confirmed"; orderId: string }
   | { role: "error"; text: string };
 
 const cents = (n: number) => `$${(n / 100).toFixed(2)}`;
@@ -36,6 +46,7 @@ const SUGGESTIONS = [
   "Avocado toast with poached egg",
   "Almond croissant and a mocha",
   "Show me the menu",
+  "Show my orders",
 ];
 
 function ModeToggle() {
@@ -52,7 +63,17 @@ function ModeToggle() {
   );
 }
 
-function OrderView({ order }: { order: Order }) {
+function OrderView({ order, onPlace }: { order: Order; onPlace: () => void }) {
+  const [placing, setPlacing] = useState(false);
+  const [placed, setPlaced] = useState(false);
+
+  const handlePlace = async () => {
+    setPlacing(true);
+    await onPlace();
+    setPlaced(true);
+    setPlacing(false);
+  };
+
   return (
     <div className="space-y-3">
       {order.items.map((item, i) =>
@@ -98,6 +119,62 @@ function OrderView({ order }: { order: Order }) {
           <Text size="sm" bold className="text-kumo-accent">{cents(order.total)} {order.currency}</Text>
         </div>
       </Surface>
+      {!placed ? (
+        <Button variant="primary" className="w-full" onClick={handlePlace}
+          loading={placing} disabled={placing}
+          icon={<ShoppingCartIcon size={16} weight="bold" />}>
+          Place Order
+        </Button>
+      ) : (
+        <Surface className="px-4 py-3 rounded-xl ring ring-green-500/30 bg-green-500/5">
+          <div className="flex items-center gap-2 justify-center">
+            <CheckCircleIcon size={16} className="text-green-600" weight="fill" />
+            <Text size="sm" bold className="text-green-600">Order placed</Text>
+          </div>
+        </Surface>
+      )}
+    </div>
+  );
+}
+
+function OrderHistoryView({ orders }: { orders: SavedOrder[] }) {
+  if (orders.length === 0) {
+    return (
+      <Surface className="px-4 py-3 rounded-2xl rounded-tl-sm ring ring-kumo-line">
+        <Text size="sm" variant="secondary">No orders yet.</Text>
+      </Surface>
+    );
+  }
+  return (
+    <div className="space-y-3">
+      {orders.map((o) => (
+        <Surface key={o.id} className="rounded-xl ring ring-kumo-line overflow-hidden">
+          <div className="px-4 py-2 border-b border-kumo-line bg-kumo-base flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <ClockIcon size={14} className="text-kumo-inactive" />
+              <Text size="xs" variant="secondary">{new Date(o.created_at).toLocaleString()}</Text>
+            </div>
+            <div className="flex items-center gap-2">
+              <Badge variant={o.status === "pending" ? "secondary" : "success"}>{o.status}</Badge>
+              <Text size="sm" bold className="text-kumo-accent">{cents(o.total)}</Text>
+            </div>
+          </div>
+          <div className="px-4 py-3 space-y-1">
+            {o.items.map((it, j) => (
+              <div key={j} className="flex justify-between">
+                <Text size="xs">
+                  {it.quantity > 1 ? `${it.quantity}x ` : ""}{it.product_name}
+                  {it.modifiers.length > 0 && (
+                    <span className="text-kumo-inactive"> ({it.modifiers.map(m => m.choice).join(", ")})</span>
+                  )}
+                  {it.note && <span className="text-kumo-inactive italic"> — {it.note}</span>}
+                </Text>
+                <Text size="xs" variant="secondary">{cents(it.unit_price * it.quantity)}</Text>
+              </div>
+            ))}
+          </div>
+        </Surface>
+      ))}
     </div>
   );
 }
@@ -148,19 +225,51 @@ function App() {
 
   const send = useCallback(async (query: string) => {
     if (!query.trim() || loading) return;
-    setMessages((prev) => [...prev, { role: "user", text: query.trim() }]);
+    const currentMessages = [...messages, { role: "user" as const, text: query.trim() }];
+    setMessages(currentMessages);
     setInput("");
     setLoading(true);
+
+    // Build conversation history for AI context (last 10, summarized)
+    const history = currentMessages.slice(-10).reduce<{ role: string; content: string }[]>((acc, m) => {
+      if (m.role === "user") {
+        acc.push({ role: "user", content: m.text });
+      } else if (m.role === "agent") {
+        let content = "";
+        if (m.type === "order") {
+          content = "Order: " + m.order.items.map((it) =>
+            `${it.product_name}${it.modifiers.length ? " (" + it.modifiers.map(mod => mod.choice).join(", ") + ")" : ""} x${it.quantity} = $${(it.item_total / 100).toFixed(2)}`
+          ).join(", ") + `. Total: $${(m.order.total / 100).toFixed(2)} ${m.order.currency}`;
+        } else if (m.type === "menu") {
+          content = "[Showed the menu]";
+        } else if (m.type === "orders") {
+          content = "[Showed order history]";
+        } else if (m.type === "answer") {
+          content = m.answer;
+        } else if (m.type === "confirmed") {
+          content = `Order confirmed: ${m.orderId}`;
+        }
+        if (content) acc.push({ role: "assistant", content });
+      }
+      return acc;
+    }, []);
+    // Remove the last entry (current user message) since we send it as `query`
+    history.pop();
+
     try {
       const res = await fetch("/api/query", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: query.trim() }),
+        body: JSON.stringify({ query: query.trim(), history }),
       });
       const data = await res.json<Record<string, unknown>>();
       if (data.ok && data.type === "order" && data.order) {
         setMessages((prev) => [...prev, { role: "agent", type: "order", order: data.order as Order }]);
       } else if (data.ok && data.type === "menu" && data.menu) {
         setMessages((prev) => [...prev, { role: "agent", type: "menu", menu: data.menu as MenuItem[] }]);
+      } else if (data.ok && data.type === "orders" && data.orders) {
+        setMessages((prev) => [...prev, { role: "agent", type: "orders", orders: data.orders as SavedOrder[] }]);
+      } else if (data.ok && data.type === "answer") {
+        setMessages((prev) => [...prev, { role: "agent", type: "answer", answer: data.answer as string }]);
       } else {
         setMessages((prev) => [...prev, { role: "error", text: (data.error as string) ?? "Unknown error" }]);
       }
@@ -168,6 +277,21 @@ function App() {
       setMessages((prev) => [...prev, { role: "error", text: err instanceof Error ? err.message : String(err) }]);
     } finally { setLoading(false); }
   }, [loading]);
+
+  const placeOrder = useCallback(async (order: Order, msgIndex: number) => {
+    const res = await fetch("/api/order", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ order }),
+    });
+    const data = await res.json<{ ok: boolean; id?: string; error?: string }>();
+    if (data.ok && data.id) {
+      setMessages((prev) => {
+        const next = [...prev];
+        next.splice(msgIndex + 1, 0, { role: "agent", type: "confirmed", orderId: data.id! });
+        return next;
+      });
+    }
+  }, []);
 
   return (
     <div className="flex flex-col h-screen bg-kumo-elevated">
@@ -230,7 +354,24 @@ function App() {
                     <RobotIcon size={14} className="text-kumo-accent" />
                   </div>
                   <div className="flex-1 min-w-0">
-                    {msg.type === "order" ? <OrderView order={msg.order} /> : <MenuView menu={msg.menu} />}
+                    {msg.type === "order" && <OrderView order={msg.order} onPlace={() => placeOrder(msg.order, i)} />}
+                    {msg.type === "menu" && <MenuView menu={msg.menu} />}
+                    {msg.type === "orders" && <OrderHistoryView orders={msg.orders} />}
+                    {msg.type === "answer" && (
+                      <Surface className="px-4 py-3 rounded-2xl rounded-tl-sm ring ring-kumo-line">
+                        <Text size="sm">{msg.answer}</Text>
+                      </Surface>
+                    )}
+                    {msg.type === "confirmed" && (
+                      <Surface className="px-4 py-3 rounded-2xl rounded-tl-sm ring ring-green-500/30 bg-green-500/5">
+                        <div className="flex items-center gap-2">
+                          <CheckCircleIcon size={16} className="text-green-600" weight="fill" />
+                          <Text size="sm" className="text-green-600">
+                            Order confirmed! ID: <code className="font-mono text-xs">{msg.orderId.slice(0, 8)}</code>
+                          </Text>
+                        </div>
+                      </Surface>
+                    )}
                   </div>
                 </div>
               </div>

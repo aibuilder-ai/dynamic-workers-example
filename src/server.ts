@@ -8,6 +8,25 @@ For orders, return:
 For menu inquiries ("show menu", "what do you have", "what's available"), return:
 {"show_menu":true}
 
+For "show ALL my orders" (no filter, no limit), return:
+{"show_orders":true}
+
+For ANY specific, filtered, or analytical question about past orders, return a SQL query:
+{"query_orders":"A SELECT SQL query against the orders schema"}
+
+Use query_orders for: last N orders, most expensive, cheapest, how many, how much spent, orders containing a specific product, orders from a date, etc.
+
+Orders schema:
+- orders (id TEXT PK, total INTEGER [cents], currency TEXT, status TEXT, created_at TEXT)
+- order_items (id INTEGER PK, order_id TEXT FK, product_retailer_id TEXT, product_name TEXT, quantity INTEGER, unit_price INTEGER [cents], currency TEXT, modifiers TEXT [JSON], note TEXT)
+
+Examples:
+- "last 2 orders" → {"query_orders":"SELECT o.id, o.total, o.currency, o.status, o.created_at, oi.product_name, oi.quantity, oi.unit_price, oi.modifiers, oi.note FROM orders o JOIN order_items oi ON oi.order_id = o.id ORDER BY o.created_at DESC LIMIT 10"}
+- "most expensive thing I ordered" → {"query_orders":"SELECT oi.product_name, oi.unit_price, o.created_at FROM order_items oi JOIN orders o ON o.id = oi.order_id ORDER BY oi.unit_price DESC LIMIT 1"}
+- "how much have I spent total" → {"query_orders":"SELECT SUM(total) as total_spent FROM orders"}
+- "how many lattes" → {"query_orders":"SELECT SUM(quantity) as count FROM order_items WHERE LOWER(product_name) LIKE '%latte%'"}
+- "did I order anything today" → {"query_orders":"SELECT o.id, o.total, o.created_at, oi.product_name, oi.quantity FROM orders o JOIN order_items oi ON oi.order_id = o.id WHERE date(o.created_at) = date('now') ORDER BY o.created_at DESC"}
+
 Rules:
 - Match product names flexibly (e.g. "oat latte" → product "Latte" with Milk modifier "Oat")
 - Only include modifiers the customer explicitly mentioned. Omit unmentioned ones — defaults are applied automatically.
@@ -102,8 +121,32 @@ export default {
       return Response.json({ menu });
     }
 
+    if (url.pathname === "/api/order" && request.method === "POST") {
+      try {
+        const body = await request.json<{ order: any }>();
+        const merchant = env.MERCHANT.get(env.MERCHANT.idFromName("default"));
+        const result = await merchant.placeOrder({
+          items: body.order.items.map((it: any) => ({
+            product_id: it.product_id, product_name: it.product_name,
+            quantity: it.quantity, unit_price: it.item_total / it.quantity,
+            currency: it.currency || "AUD", modifiers: it.modifiers, note: it.note,
+          })),
+          total: body.order.total, currency: body.order.currency || "AUD",
+        });
+        return Response.json({ ok: true, ...result });
+      } catch (err) {
+        return Response.json({ ok: false, error: err instanceof Error ? err.message : String(err) }, { status: 500 });
+      }
+    }
+
+    if (url.pathname === "/api/orders") {
+      const merchant = env.MERCHANT.get(env.MERCHANT.idFromName("default"));
+      const orders = await merchant.getOrders();
+      return Response.json({ ok: true, orders });
+    }
+
     if (url.pathname === "/api/query" && request.method === "POST") {
-      let body: { query?: string };
+      let body: { query?: string; history?: { role: string; content: string }[] };
       try { body = await request.json(); }
       catch { return Response.json({ ok: false, error: "Invalid JSON body" }, { status: 400 }); }
 
@@ -115,27 +158,57 @@ export default {
         const menu = await merchant.getMenu();
         const menuText = formatMenuForAI(menu as Record<string, unknown>[]);
 
+        // Build messages with conversation history
+        const messages: { role: "system" | "user" | "assistant"; content: string }[] = [
+          { role: "system", content: SYSTEM_PROMPT + "\n\nMenu:\n" + menuText },
+        ];
+        // Add last 10 history entries
+        const history = (body.history ?? []).slice(-10);
+        for (const h of history) {
+          if (h.role === "user" || h.role === "assistant") {
+            messages.push({ role: h.role, content: h.content });
+          }
+        }
+        messages.push({ role: "user", content: query });
+
         const aiResponse = await env.AI.run(
           "@cf/meta/llama-4-scout-17b-16e-instruct" as BaseAiTextGenerationModels,
-          { messages: [
-              { role: "system", content: SYSTEM_PROMPT + "\n\nMenu:\n" + menuText },
-              { role: "user", content: query },
-            ], max_tokens: 512 }
+          { messages, max_tokens: 512 }
         );
 
         let intent: Record<string, unknown>;
         const resp = aiResponse as Record<string, unknown>;
-        if (resp.items || resp.show_menu) { intent = resp; }
+        if (resp.items || resp.show_menu || resp.show_orders || resp.query_orders) { intent = resp; }
         else if (typeof resp.response === "string") { intent = JSON.parse(extractJson(resp.response)); }
         else if (resp.response && typeof resp.response === "object") {
           const inner = resp.response as Record<string, unknown>;
-          if (inner.items || inner.show_menu) intent = inner;
+          if (inner.items || inner.show_menu || inner.show_orders || inner.query_orders) intent = inner;
           else return Response.json({ ok: false, error: "Unexpected AI response", raw: JSON.stringify(aiResponse) }, { status: 500 });
         } else {
           return Response.json({ ok: false, error: "Unexpected AI response", raw: JSON.stringify(aiResponse) }, { status: 500 });
         }
 
         if (intent.show_menu) return Response.json({ ok: true, type: "menu", menu });
+
+        if (intent.show_orders) {
+          const orders = await merchant.getOrders();
+          return Response.json({ ok: true, type: "orders", orders });
+        }
+
+        if (typeof intent.query_orders === "string") {
+          const rows = await merchant.query(intent.query_orders);
+          // Second AI call to format the raw SQL result into a natural language answer
+          const answerResponse = await env.AI.run(
+            "@cf/meta/llama-4-scout-17b-16e-instruct" as BaseAiTextGenerationModels,
+            { messages: [
+                { role: "system", content: "You are a helpful assistant. Given a user's question and SQL query results, write a short, friendly answer. Prices are in cents — convert to dollars (e.g. 670 → $6.70). Return ONLY the answer text, no JSON." },
+                { role: "user", content: `Question: ${query}\n\nQuery results:\n${JSON.stringify(rows)}` },
+              ], max_tokens: 256 }
+          );
+          const answerResp = answerResponse as Record<string, unknown>;
+          const answer = String(answerResp.response ?? answerResp.text ?? JSON.stringify(rows));
+          return Response.json({ ok: true, type: "answer", answer, rows });
+        }
 
         if (!Array.isArray(intent.items) || intent.items.length === 0) {
           return Response.json({ ok: false, error: "Could not understand order", raw: JSON.stringify(intent) }, { status: 400 });
