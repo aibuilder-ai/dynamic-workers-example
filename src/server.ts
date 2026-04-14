@@ -30,9 +30,7 @@ function formatMenuForAI(menu: Record<string, unknown>[]): string {
                       (m: any) =>
                         m.name +
                         (m.is_default ? "*" : "") +
-                        (m.price_delta
-                          ? ` +$${(m.price_delta / 100).toFixed(2)}`
-                          : "")
+                        (m.price_delta ? ` +$${(m.price_delta / 100).toFixed(2)}` : "")
                     )
                     .join(", ")}`
               )
@@ -51,7 +49,6 @@ function extractJson(text: string): string {
   return text.trim();
 }
 
-// Template for the dynamic worker that processes orders against menu data
 function buildOrderWorker(menu: unknown[], intent: unknown): string {
   return `
 const MENU = ${JSON.stringify(menu)};
@@ -60,60 +57,32 @@ const INTENT = ${JSON.stringify(intent)};
 export default {
   async fetch() {
     const items = [];
-
     for (const item of INTENT.items) {
       const query = item.product.toLowerCase();
       const product = MENU.find(p =>
         p.title.toLowerCase().includes(query) ||
         p.retailer_id.toLowerCase() === query
       );
-      if (!product) {
-        items.push({ error: "Product not found: " + item.product });
-        continue;
-      }
+      if (!product) { items.push({ error: "Product not found: " + item.product }); continue; }
 
       const appliedMods = [];
       let modTotal = 0;
-
-      // Apply customer-specified modifiers
       for (const [groupName, choiceName] of Object.entries(item.modifiers || {})) {
-        const group = product.modifier_groups.find(g =>
-          g.name.toLowerCase() === groupName.toLowerCase()
-        );
+        const group = product.modifier_groups.find(g => g.name.toLowerCase() === groupName.toLowerCase());
         if (group) {
-          const m = group.modifiers.find(mod =>
-            mod.name.toLowerCase() === choiceName.toLowerCase()
-          );
-          if (m) {
-            appliedMods.push({ group: group.name, choice: m.name, price_delta: m.price_delta });
-            modTotal += m.price_delta;
-          }
+          const m = group.modifiers.find(mod => mod.name.toLowerCase() === choiceName.toLowerCase());
+          if (m) { appliedMods.push({ group: group.name, choice: m.name, price_delta: m.price_delta }); modTotal += m.price_delta; }
         }
       }
-
-      // Fill in defaults for unspecified modifier groups
       for (const group of product.modifier_groups) {
         if (!appliedMods.find(am => am.group === group.name)) {
           const def = group.modifiers.find(m => m.is_default);
-          if (def) {
-            appliedMods.push({ group: group.name, choice: def.name, price_delta: def.price_delta });
-            modTotal += def.price_delta;
-          }
+          if (def) { appliedMods.push({ group: group.name, choice: def.name, price_delta: def.price_delta }); modTotal += def.price_delta; }
         }
       }
-
       const qty = item.quantity || 1;
-      items.push({
-        product_id: product.retailer_id,
-        product_name: product.title,
-        base_price: product.price,
-        quantity: qty,
-        modifiers: appliedMods,
-        item_total: (product.price + modTotal) * qty,
-        currency: product.currency,
-      });
+      items.push({ product_id: product.retailer_id, product_name: product.title, base_price: product.price, quantity: qty, modifiers: appliedMods, item_total: (product.price + modTotal) * qty, currency: product.currency });
     }
-
     const total = items.reduce((s, i) => s + (i.item_total || 0), 0);
     return Response.json({ order: { items, total, currency: "AUD" } });
   }
@@ -121,80 +90,55 @@ export default {
 }
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // ── Menu endpoint ────────────────────────────────────────
     if (url.pathname === "/api/menu") {
       const merchant = env.MERCHANT.get(env.MERCHANT.idFromName("default"));
       const menu = await merchant.getMenu();
       return Response.json({ menu });
     }
 
-    // ── Query endpoint ───────────────────────────────────────
     if (url.pathname === "/api/query" && request.method === "POST") {
       let body: { query?: string };
-      try {
-        body = await request.json();
-      } catch {
-        return Response.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
-      }
+      try { body = await request.json(); }
+      catch { return Response.json({ ok: false, error: "Invalid JSON body" }, { status: 400 }); }
 
       const query = body.query?.trim();
-      if (!query) {
-        return Response.json({ ok: false, error: "No query provided" }, { status: 400 });
-      }
+      if (!query) return Response.json({ ok: false, error: "No query provided" }, { status: 400 });
 
       try {
-        // 1. Fetch menu from Merchant DO
         const merchant = env.MERCHANT.get(env.MERCHANT.idFromName("default"));
         const menu = await merchant.getMenu();
         const menuText = formatMenuForAI(menu as Record<string, unknown>[]);
 
-        // 2. Ask AI to interpret the order
         const aiResponse = await env.AI.run(
           "@cf/meta/llama-4-scout-17b-16e-instruct" as BaseAiTextGenerationModels,
-          {
-            messages: [
+          { messages: [
               { role: "system", content: SYSTEM_PROMPT + "\n\nMenu:\n" + menuText },
               { role: "user", content: query },
-            ],
-            max_tokens: 512,
-          }
+            ], max_tokens: 512 }
         );
 
-        // 3. Parse AI response (handles both string and direct object)
         let intent: Record<string, unknown>;
         const resp = aiResponse as Record<string, unknown>;
-
-        if (resp.items || resp.show_menu) {
-          intent = resp;
-        } else if (typeof resp.response === "string") {
-          intent = JSON.parse(extractJson(resp.response));
-        } else if (resp.response && typeof resp.response === "object") {
-          intent = resp.response as Record<string, unknown>;
+        if (resp.items || resp.show_menu) { intent = resp; }
+        else if (typeof resp.response === "string") { intent = JSON.parse(extractJson(resp.response)); }
+        else if (resp.response && typeof resp.response === "object") {
+          const inner = resp.response as Record<string, unknown>;
+          if (inner.items || inner.show_menu) intent = inner;
+          else return Response.json({ ok: false, error: "Unexpected AI response", raw: JSON.stringify(aiResponse) }, { status: 500 });
         } else {
-          return Response.json(
-            { ok: false, error: "Unexpected AI response", raw: JSON.stringify(aiResponse) },
-            { status: 500 }
-          );
+          return Response.json({ ok: false, error: "Unexpected AI response", raw: JSON.stringify(aiResponse) }, { status: 500 });
         }
 
-        // 4. Handle menu requests
-        if (intent.show_menu) {
-          return Response.json({ ok: true, type: "menu", menu });
-        }
+        if (intent.show_menu) return Response.json({ ok: true, type: "menu", menu });
 
-        // 5. Run dynamic worker to process the order
         if (!Array.isArray(intent.items) || intent.items.length === 0) {
-          return Response.json(
-            { ok: false, error: "Could not understand order", raw: JSON.stringify(intent) },
-            { status: 400 }
-          );
+          return Response.json({ ok: false, error: "Could not understand order", raw: JSON.stringify(intent) }, { status: 400 });
         }
 
         const workerCode = buildOrderWorker(menu as unknown[], intent);
-
         const worker = env.LOADER.load({
           compatibilityDate: "2026-01-28",
           mainModule: "worker.js",
@@ -204,14 +148,10 @@ export default {
 
         const result = await worker.getEntrypoint().fetch(new Request("https://worker/"));
         const data = await result.json();
-
         return Response.json({ ok: true, type: "order", ...data as object });
       } catch (err) {
         console.error("[agent] error:", err);
-        return Response.json(
-          { ok: false, error: err instanceof Error ? err.message : String(err) },
-          { status: 500 }
-        );
+        return Response.json({ ok: false, error: err instanceof Error ? err.message : String(err) }, { status: 500 });
       }
     }
 

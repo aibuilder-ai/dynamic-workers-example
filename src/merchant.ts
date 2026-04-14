@@ -52,8 +52,6 @@ export class Merchant extends DurableObject {
     }
   }
 
-  // ── Seed data ────────────────────────────────────────────────
-
   private seed() {
     const product = (rid: string, title: string, desc: string, price: number, cat: string) => {
       this.sql.exec(
@@ -78,7 +76,6 @@ export class Merchant extends DurableObject {
       );
     };
 
-    // Shared helpers for common modifier patterns
     const addSizes = (pid: number) => {
       const g = grp(pid, "Size", "variation", 1, 1);
       mod(g, "Small", 0, true);
@@ -93,8 +90,6 @@ export class Merchant extends DurableObject {
       mod(g, "Almond", 70, false);
       mod(g, "Soy", 50, false);
     };
-
-    // ── Coffee ─────────────────────────────────────────────────
 
     const espresso = product("espresso", "Espresso", "Rich double shot of espresso", 400, "Coffee");
     let g = grp(espresso, "Size", "variation", 1, 1);
@@ -122,8 +117,6 @@ export class Merchant extends DurableObject {
     mod(g, "Regular", 0, true);
     mod(g, "Large", 50, false);
 
-    // ── Food ───────────────────────────────────────────────────
-
     const banana = product("banana-bread", "Banana Bread", "House-baked banana bread slice", 650, "Food");
     g = grp(banana, "Warmed", "option", 1, 1);
     mod(g, "No", 0, true);
@@ -150,8 +143,6 @@ export class Merchant extends DurableObject {
     mod(g, "Chocolate", 100, false);
   }
 
-  // ── Public RPC ───────────────────────────────────────────────
-
   async getMenu() {
     const products = [...this.sql.exec(
       "SELECT * FROM products WHERE availability = 'in stock' ORDER BY category, title"
@@ -164,30 +155,17 @@ export class Merchant extends DurableObject {
       )] as Record<string, unknown>[];
 
       return {
-        id: p.id,
-        retailer_id: p.retailer_id,
-        title: p.title,
-        description: p.description,
-        price: p.price,
-        currency: p.currency,
-        category: p.category,
+        id: p.id, retailer_id: p.retailer_id, title: p.title, description: p.description,
+        price: p.price, currency: p.currency, category: p.category,
         modifier_groups: groups.map((g) => {
           const mods = [...this.sql.exec(
             "SELECT * FROM product_modifiers WHERE group_id = ? ORDER BY sort_order, id",
             g.id as number
           )] as Record<string, unknown>[];
-
           return {
-            id: g.id,
-            name: g.name,
-            type: g.type,
-            min_select: g.min_select,
-            max_select: g.max_select,
+            id: g.id, name: g.name, type: g.type, min_select: g.min_select, max_select: g.max_select,
             modifiers: mods.map((m) => ({
-              id: m.id,
-              name: m.name,
-              price_delta: m.price_delta,
-              is_default: Boolean(m.is_default),
+              id: m.id, name: m.name, price_delta: m.price_delta, is_default: Boolean(m.is_default),
             })),
           };
         }),
