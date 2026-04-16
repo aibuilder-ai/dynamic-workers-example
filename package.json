@@ -14,6 +14,7 @@
     "@cloudflare/kumo": "^1.18.0",
     "@phosphor-icons/react": "^2.1.10",
     "ai": "^6.0.159",
+    "hono": "^4.12.14",
     "react": "^19.2.5",
     "react-dom": "^19.2.5"
   },

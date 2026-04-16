@@ -30,7 +30,7 @@ type MenuItem = {
 
 type Message =
   | { role: "user"; text: string }
-  | { role: "agent"; type: "order"; order: Order }
+  | { role: "agent"; type: "order"; order: Order; query: string; intent: Record<string, unknown> }
   | { role: "agent"; type: "menu"; menu: MenuItem[] }
   | { role: "agent"; type: "orders"; orders: SavedOrder[] }
   | { role: "agent"; type: "answer"; answer: string }
@@ -267,7 +267,11 @@ function App() {
       });
       const data = await res.json<Record<string, unknown>>();
       if (data.ok && data.type === "order" && data.order) {
-        setMessages((prev) => [...prev, { role: "agent", type: "order", order: data.order as Order }]);
+        setMessages((prev) => [...prev, {
+          role: "agent", type: "order", order: data.order as Order,
+          query: query.trim(),
+          intent: (data.intent as Record<string, unknown>) ?? {},
+        }]);
       } else if (data.ok && data.type === "menu" && data.menu) {
         setMessages((prev) => [...prev, { role: "agent", type: "menu", menu: data.menu as MenuItem[] }]);
       } else if (data.ok && data.type === "orders" && data.orders) {
@@ -282,10 +286,12 @@ function App() {
     } finally { setLoading(false); }
   }, [loading]);
 
-  const placeOrder = useCallback(async (order: Order, msgIndex: number) => {
+  const placeOrder = useCallback(async (
+    order: Order, query: string, intent: Record<string, unknown>, msgIndex: number
+  ) => {
     const res = await fetch("/api/order", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ order }),
+      body: JSON.stringify({ order, query, intent }),
     });
     const data = await res.json<{ ok: boolean; id?: string; error?: string }>();
     if (data.ok && data.id) {
@@ -402,7 +408,7 @@ function App() {
                     <RobotIcon size={14} className="text-kumo-accent" />
                   </div>
                   <div className="flex-1 min-w-0">
-                    {msg.type === "order" && <OrderView order={msg.order} onPlace={() => placeOrder(msg.order, i)} />}
+                    {msg.type === "order" && <OrderView order={msg.order} onPlace={() => placeOrder(msg.order, msg.query, msg.intent, i)} />}
                     {msg.type === "menu" && <MenuView menu={msg.menu} />}
                     {msg.type === "orders" && <OrderHistoryView orders={msg.orders} />}
                     {msg.type === "answer" && (
