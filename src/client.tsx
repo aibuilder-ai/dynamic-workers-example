@@ -7,7 +7,7 @@ import {
 import {
   PaperPlaneRightIcon, TrashIcon, CoffeeIcon, SpinnerGapIcon,
   MoonIcon, SunIcon, UserIcon, RobotIcon, ShoppingCartIcon,
-  CheckCircleIcon, ClockIcon,
+  CheckCircleIcon, ClockIcon, MicrophoneIcon, StopIcon,
 } from "@phosphor-icons/react";
 
 type OrderModifier = { group: string; choice: string; price_delta: number };
@@ -219,7 +219,11 @@ function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, loading]);
 
@@ -292,6 +296,50 @@ function App() {
       });
     }
   }, []);
+
+  const toggleRecording = useCallback(async () => {
+    if (recording) {
+      mediaRecorderRef.current?.stop();
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) audioChunksRef.current.push(event.data);
+      };
+
+      mediaRecorder.onstop = async () => {
+        stream.getTracks().forEach((track) => track.stop());
+        setRecording(false);
+        setTranscribing(true);
+        try {
+          const audioBlob = new Blob(audioChunksRef.current, { type: "audio/webm" });
+          const formData = new FormData();
+          formData.append("audio", audioBlob, "recording.webm");
+          const res = await fetch("/api/transcribe", { method: "POST", body: formData });
+          const data = await res.json<{ ok: boolean; text?: string; error?: string }>();
+          if (data.ok && data.text) {
+            send(data.text);
+          } else {
+            setMessages((prev) => [...prev, { role: "error", text: data.error ?? "Transcription failed" }]);
+          }
+        } catch (err) {
+          setMessages((prev) => [...prev, { role: "error", text: err instanceof Error ? err.message : String(err) }]);
+        } finally {
+          setTranscribing(false);
+        }
+      };
+
+      mediaRecorder.start();
+      setRecording(true);
+    } catch {
+      setMessages((prev) => [...prev, { role: "error", text: "Microphone access denied. Please allow microphone permissions." }]);
+    }
+  }, [recording, send]);
 
   return (
     <div className="flex flex-col h-screen bg-kumo-elevated">
@@ -401,10 +449,19 @@ function App() {
         <form onSubmit={(e) => { e.preventDefault(); send(input); }}
           className="max-w-3xl mx-auto flex items-center gap-3">
           <input type="text" value={input} onChange={(e) => setInput(e.target.value)}
-            placeholder="Order something... e.g. 'Large oat latte'"
+            placeholder={transcribing ? "Transcribing..." : "Order something... e.g. 'Large oat latte'"}
             className="flex-1 px-4 py-2.5 rounded-xl bg-kumo-elevated text-kumo-default text-sm border border-kumo-line outline-none focus:ring-2 focus:ring-kumo-accent/40 placeholder:text-kumo-inactive"
-            disabled={loading} />
-          <Button type="submit" variant="primary" shape="square" disabled={loading || !input.trim()}
+            disabled={loading || transcribing} />
+          <Button type="button" variant={recording ? "destructive" : "secondary"} shape="square"
+            disabled={loading || transcribing}
+            onClick={toggleRecording}
+            icon={recording
+              ? <StopIcon size={16} weight="fill" className="animate-pulse" />
+              : transcribing
+                ? <SpinnerGapIcon size={16} className="animate-spin" />
+                : <MicrophoneIcon size={16} />}
+            aria-label={recording ? "Stop recording" : "Record voice order"} />
+          <Button type="submit" variant="primary" shape="square" disabled={loading || transcribing || !input.trim()}
             icon={<PaperPlaneRightIcon size={16} weight="fill" />} aria-label="Send" />
         </form>
       </div>

@@ -376,6 +376,26 @@ export default {
       return Response.json({ ok: true, orders });
     }
 
+    if (url.pathname === "/api/transcribe" && request.method === "POST") {
+      try {
+        const formData = await request.formData();
+        const audioFile = formData.get("audio");
+        if (!audioFile || !(audioFile instanceof Blob)) {
+          return Response.json({ ok: false, error: "No audio file provided" }, { status: 400 });
+        }
+        const buffer = await audioFile.arrayBuffer();
+        const audio = [...new Uint8Array(buffer)];
+        const result = await env.AI.run("@cf/openai/whisper", { audio });
+        return Response.json({ ok: true, text: result.text });
+      } catch (err) {
+        console.error("[transcribe] error:", err);
+        return Response.json(
+          { ok: false, error: err instanceof Error ? err.message : String(err) },
+          { status: 500 }
+        );
+      }
+    }
+
     if (url.pathname === "/api/query" && request.method === "POST") {
       let body: { query?: string; history?: { role: string; content: string }[] };
       try { body = await request.json(); }
